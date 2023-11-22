@@ -28,6 +28,7 @@ import json
 import random;random.seed(42)
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
+
 def _make_r_io_base(f, mode: str):
     if not isinstance(f, io.IOBase):
         f = open(f, mode=mode)
@@ -52,9 +53,13 @@ PROMPT_DICT = {
         "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
     ),
     "prompt_no_input": (
-    "Dưới đây là hướng dẫn mô tả một bài toán tiểu học. "
-    "Viết lời giải để hoàn thành bài toán.\n\n"
-    "### Bài toán:\n{instruction}\n\n### Câu trả lời:"
+        # "Below is a multiple choices math question which have 4 posible choices which only one is the correct answer."
+        # "Write a response that appropriately completes the request.\n\n"
+        "Answer the following question by reasoning step-by-step."
+        # "Question: \n{instruction}\n\n Answer:"
+        # "Below is an instruction that describes a task. "
+        # "Write a response that appropriately completes the request.\n\n"
+        "### Q:\n{instruction}\n\n### A: "
     ),
 }
 #### 28
@@ -251,33 +256,52 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args, remaining_args = parser.parse_args_into_dataclasses(return_remaining_strings=True)
     data_args.data_length = int(remaining_args[1])
-    
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16
-    )
+    print("USING PEFT TRAINING: ", remaining_args[3])
+    use_peft = remaining_args[3] == 'True'
+    if use_peft:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
 
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM, inference_mode=False, 
-        r=8, lora_alpha=32, lora_dropout=0.05
-    )
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM, inference_mode=False, 
+            r=8, lora_alpha=16, 
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+                "lm_head",
+            ],
+            lora_dropout=0.05
+        )
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        quantization_config=bnb_config, device_map={"":0},
-        #cache_dir=training_args.cache_dir,
-    )
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            quantization_config=bnb_config, device_map={"":0},
+            # cache_dir=training_args.cache_dir,
+        )
 
-    #model.gradient_checkpointing_enable()
-    #model = prepare_model_for_kbit_training(model)
-    
-    model = get_peft_model(model, peft_config)
+        model.gradient_checkpointing_enable()
+        model = prepare_model_for_kbit_training(model)
+
+        
+        model = get_peft_model(model, peft_config)
+
+    else:
+        model = transformers.AutoModelForSeq2SeqLM.from_pretrained(
+            model_args.model_name_or_path,
+        )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
+        #cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=False,

@@ -6,16 +6,20 @@ import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    AutoModelForSeq2SeqLM,
     BitsAndBytesConfig,
     StoppingCriteriaList,
-    StoppingCriteria
+    StoppingCriteria,
+    Trainer
 )
 from peft import PeftModel    
 
+import pandas as pd
 import util
 from vllm import LLM, SamplingParams
 import sys
 from tqdm import tqdm
+import random
 MAX_INT = sys.maxsize
 INVALID_ANS = "[invalid]"
 
@@ -91,14 +95,20 @@ def batch_data(data_list, batch_size=1):
     batch_data.append(data_list[last_start:last_end])
     return batch_data
 
-def test_hendrycks_math(model, checkpoint, data_path, start=0, end=MAX_INT, batch_size=1, tensor_parallel_size=1):
+def test_hendrycks_math(model, data_path, use_peft=False, checkpoint=None, start=0, end=MAX_INT, batch_size=1, tensor_parallel_size=1):
     hendrycks_math_ins = []
     hendrycks_math_answers = []
     problem_prompt = (
-        "Dưới đây là hướng dẫn mô tả một bài toán tiểu học. "
-        "Viết lời giải để hoàn thành bài toán.\n\n"
-        "### Bài toán:\n{instruction}\n\n### Hãy nghĩ theo từng bước. Câu trả lời:"
+        #"Dưới đây là hướng dẫn mô tả một bài toán tiểu học. "
+        #"Viết lời giải để hoàn thành bài toán.\n\n"
+        "Answer the following question by reasoning step-by-step."
+
+        #"### Bài toán:\n{instruction}\n\n### Hãy nghĩ theo từng bước. Đáp án là:",
+        "Q: \n{instruction}\n\n A: "
+
     )
+    labels = pd.read_csv("./data/test/math_test_hand_label.csv")
+
     print('promt =====', problem_prompt)
     with open(data_path, "r+", encoding="utf8") as f:
         test_data = json.load(f)
@@ -114,81 +124,117 @@ def test_hendrycks_math(model, checkpoint, data_path, start=0, end=MAX_INT, batc
     #hendrycks_math_answers = hendrycks_math_answers[start:end]
     print('lenght ====', len(hendrycks_math_ins))
     batch_hendrycks_math_ins = batch_data(hendrycks_math_ins, batch_size=batch_size)
-
     stop_tokens = ["Question:", "Question", "USER:", "USER", "ASSISTANT:", "ASSISTANT", "Instruction:", "Instruction", "Response:", "Response"]
     stop = StopOnTokens()
     sampling_params = dict(
         temperature=0, 
         top_p=1, 
         do_sample=False,
-        max_new_tokens=2048, 
-        stopping_criteria=StoppingCriteriaList([stop]))
+        max_new_tokens=1024)
+        # stopping_criteria=StoppingCriteriaList([stop]))
 
     print('sampling =====', sampling_params)
-    
-    
-    device_map = {"": 0}
-    # Load tokenizer and model with QLoRA configuration
-    compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
+    if use_peft:        
+        device_map = {"": 0}
+        # Load tokenizer and model with QLoRA configuration
+        compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=use_4bit,
-        bnb_4bit_quant_type=bnb_4bit_quant_type,
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=use_nested_quant,
-    )
-    llm = AutoModelForCausalLM.from_pretrained(
-        model,
-        quantization_config=bnb_config,
-        device_map=device_map,
-    )
-    llm = PeftModel.from_pretrained(llm, checkpoint)
-    llm = llm.merge_and_unload()
+        bnb_config = BitsAndBytesConfig(
+            load_in_4=use_4bit,
+            bnb_4bit_quant_type=bnb_4bit_quant_type,
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_use_double_quant=use_nested_quant,
+        )
+        llm = AutoModelForCausalLM.from_pretrained(
+            model,
+            #quantization_config=bnb_config,
+            device_map=device_map,
+        )
+        print("load from peft checkpoint: ", checkpoint)
+        llm = PeftModel.from_pretrained(llm, checkpoint)
+        llm = llm.merge_and_unload()
+        # llm = LLM(model=model,tensor_parallel_size=tensor_parallel_size)
+    else:
+        llm = AutoModelForSeq2SeqLM.from_pretrained(model)
+
+
     tokenizer = AutoTokenizer.from_pretrained(model)
 
-    # llm = LLM(model=model,tensor_parallel_size=tensor_parallel_size)
-
+    submission = []
 
     res_completions = []
+    total_correct = 0
+
     for idx, prompt in tqdm(enumerate(batch_hendrycks_math_ins), total=len(batch_hendrycks_math_ins)):
         if isinstance(prompt, list):
             pass
         else:
             prompt = [prompt]
+        #print(prompt)
+        label = labels.iloc[idx]
         input_ids = tokenizer.batch_encode_plus(
             prompt, 
-            padding=True,
-            truncation=True,
+            #padding=True,
+            #truncation=True,
             return_tensors="pt").input_ids
         input_ids = input_ids.to(llm.device)
 
         completions = llm.generate(input_ids=input_ids, **sampling_params)
         #prompt_temp = output.prompt
         generated_text = tokenizer.batch_decode(completions, skip_special_tokens=True)
+        
+
+        sample = test_data[idx]
+        ans = generated_text[0].split('\n')[-1].lower().strip()
+
+        final_ans = None
+        
+        for possible_res in ["đáp án là", "đáp án chính xác là", "the answer is",  "câu trả lời", "đáp xuất"]:
+            ans = ans.replace(possible_res, "đáp án")
+
+        if "đáp án" in ans:
+            choice = ans.split("đáp án")[-1].replace(":", "").replace(".", "").strip()
+            
+            print(sample['id'], choice)
+            for answer in sample['choices']:
+                if choice in answer.lower().replace(".", "").strip():
+                    final_ans = answer
+                        
+        if final_ans is None:
+            final_ans = sample['choices'][random.randint(0, len(sample['choices']) - 1)]
+
+        submission.append({'id': sample['id'], 'answer': final_ans})
+        print("Final answer:  ", final_ans)
+        print("Label:  ", label['answer'])
+
+        correct = final_ans == label['answer']
+        total_correct += correct
+        print("CORRECT: ", correct)
+
         print("Generated Text: ", generated_text)
         res_completions += generated_text
 
-    results = []
-    for idx, (prompt, completion) in enumerate(zip(hendrycks_math_ins, res_completions, hendrycks_math_answers)):
-        res = process_results(prompt, completion)
-        results.append(res)
+    print("Accuracy: ", total_correct / len(test_data))
+    pd.DataFrame(submission).to_csv("submission.csv", index=False)
 
-    acc = sum(results) / len(results)
-    print('len invalid outputs ====', len(invalid_outputs), ', valid_outputs===', invalid_outputs)
-    print('start===', start, ', end====',end)
-    print('length====', len(results), ', acc====', acc)
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default='')  # model path
-    parser.add_argument("--checkpoint", type=str, default='')  # model path
+    parser.add_argument("--checkpoint", type=str, default=None)  # model path
     parser.add_argument("--data_file", type=str, default='')  # data path
     parser.add_argument("--start", type=int, default=0) #start index
     parser.add_argument("--end", type=int, default=MAX_INT)  # end index
     parser.add_argument("--batch_size", type=int, default=400)  # batch_size
+    parser.add_argument("--use_peft", type=bool, default=False)  # batch_size
     parser.add_argument("--tensor_parallel_size", type=int, default=8)  # tensor_parallel_size
     return parser.parse_args()
 
 if __name__ == "__main__":
     args = parse_args()
-    test_hendrycks_math(model=args.model, checkpoint=args.checkpoint, data_path=args.data_file, start=args.start, end=args.end, batch_size=args.batch_size, tensor_parallel_size=args.tensor_parallel_size)
+    test_hendrycks_math(
+        model=args.model, 
+        checkpoint=args.checkpoint, 
+        data_path=args.data_file, 
+        use_peft=args.use_peft,
+        start=args.start, end=args.end, batch_size=args.batch_size, tensor_parallel_size=args.tensor_parallel_size)
